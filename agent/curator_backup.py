@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 import tarfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from itertools import chain, count
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -102,7 +102,7 @@ def _backup_cron_jobs_into(dest: Path) -> dict[str, Any]:
 
 def _utc_id(now: Optional[datetime] = None) -> str:
     """UTC ISO-ish filesystem-safe timestamp: ``2026-05-01T13-05-42Z``."""
-    s = (datetime.now(timezone.utc) if now is None else now).replace(microsecond=0).isoformat()
+    s = (datetime.now(UTC) if now is None else now).replace(microsecond=0).isoformat()
     return s.removesuffix("+00:00").replace(":", "-") + "Z"
 
 
@@ -136,7 +136,7 @@ def _write_manifest(dest: Path, reason: str, archive_path: Path, skills_counted:
         cron_jobs["reason"] = cron_info.get("reason", "not captured")
     if cron_info.get("parse_warning"):
         cron_jobs["parse_warning"] = cron_info["parse_warning"]
-    manifest = {"id": dest.name, "reason": reason, "created_at": datetime.now(timezone.utc).isoformat(), "archive": archive_path.name,
+    manifest = {"id": dest.name, "reason": reason, "created_at": datetime.now(UTC).isoformat(), "archive": archive_path.name,
                 "archive_bytes": archive_path.stat().st_size, "skill_files": skills_counted, "cron_jobs": cron_jobs}
     (dest / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -448,14 +448,19 @@ def rollback(backup_id: Optional[str] = None) -> tuple[bool, str, Optional[Path]
 
     try:
         with tarfile.open(archive, "r:gz") as tf:
-            # Reject absolute paths and ".." defensively; Python 3.12+ also gets filter='data', older interpreters fall back unfiltered.
+            # Reject absolute paths and ".." defensively; interpreters with tar filters also get filter='data'.
             for member in tf.getmembers():
                 if member.name.startswith("/") or ".." in Path(member.name).parts:
                     raise tarfile.TarError(f"refusing to extract unsafe path: {member.name!r}")
             try:
                 tf.extractall(str(skills), filter="data")  # type: ignore[call-arg]
             except TypeError:
-                tf.extractall(str(skills))  # Python < 3.12 — no filter kwarg
+                # Python 3.11.0-3.11.3 has no filter kwarg; unfiltered extraction would follow a link member out of skills/, so
+                # only regular files and directories are allowed here (stricter than 'data', which permits in-tree links).
+                for member in tf.getmembers():
+                    if not (member.isfile() or member.isdir()):
+                        raise tarfile.TarError(f"refusing to extract non-file member: {member.name!r}")
+                tf.extractall(str(skills))
     except (OSError, tarfile.TarError) as e:
         # A partial extract can leave entries the original tree never had; drop those first or the "restored" tree is skills + a slice of snapshot.
         keep = _EXCLUDE_TOP_LEVEL | {orig.name for orig, _ in moved}

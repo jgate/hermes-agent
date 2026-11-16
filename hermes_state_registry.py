@@ -37,6 +37,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Tuple
 
+from hermes_state_common import path_is_under as _path_is_under
 from hermes_state_common import stat_db_file_identity as _stat_db_file_identity
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, typed only
@@ -69,7 +70,7 @@ class _Generation:
 
     __slots__ = ("db", "identity", "path", "refcount", "retired")
 
-    def __init__(self, path: Path, db: "SessionDB", identity: Optional[tuple[int, int]]) -> None:
+    def __init__(self, path: Path, db: SessionDB, identity: Optional[tuple[int, int]]) -> None:
         self.path = path
         self.db = db
         self.refcount = 1
@@ -98,21 +99,21 @@ _tearing_down: dict[Path, _TeardownBarrier] = {}
 _path_lifecycle_locks: dict[Path, threading.Lock] = {}
 
 
-def _open_session_db(path: Path) -> "SessionDB":
+def _open_session_db(path: Path) -> SessionDB:
     """Construct the SessionDB for *path* (call-time import avoids cycles; tests patch this)."""
     from hermes_state import SessionDB
 
     return SessionDB(db_path=path)
 
 
-def _teardown(db: "SessionDB") -> None:
+def _teardown(db: SessionDB) -> None:
     """Close a shared instance, clearing its registry-owned flag first."""
     with contextlib.suppress(Exception):
         db._shared_registry_owned = False
     _close_quietly(db, "Error closing shared SessionDB")
 
 
-def _close_quietly(db: "SessionDB", debug_message: str) -> None:
+def _close_quietly(db: SessionDB, debug_message: str) -> None:
     """close() that never propagates. A lost WAL generation whose capture failed is data at risk,
     not teardown noise: the handle stays open and the operator has to act, so that one surfaces."""
     try:
@@ -161,7 +162,7 @@ def _finish_teardown(path: Path, barrier: _TeardownBarrier) -> None:
 
 def _teardown_generation(
     path: Path,
-    db: "SessionDB",
+    db: SessionDB,
     *,
     barrier: Optional[_TeardownBarrier] = None,
 ) -> None:
@@ -176,7 +177,7 @@ def _teardown_generation(
             _finish_teardown(path, barrier)
 
 
-def _db_path_of(db: "SessionDB") -> Optional[Path]:
+def _db_path_of(db: SessionDB) -> Optional[Path]:
     """``Path(db.db_path)`` or None when absent/unconvertible."""
     path = getattr(db, "db_path", None)
     try:
@@ -192,7 +193,7 @@ def _finish_opening(path: Path, opening: threading.Event) -> None:
     opening.set()
 
 
-def acquire(db_path: Optional[Path] = None) -> "SessionDB":
+def acquire(db_path: Optional[Path] = None) -> SessionDB:
     """Return the shared SessionDB for *db_path*, incrementing its refcount. If the file was
     replaced (different inode) since the generation opened, that generation is RETIRED
     but stays alive for its holders, and a fresh one is opened in its place. Raises
@@ -201,6 +202,10 @@ def acquire(db_path: Optional[Path] = None) -> "SessionDB":
     from hermes_state import _default_db_path
 
     raw_path = Path(db_path) if db_path is not None else Path(_default_db_path())
+    if os.name != "nt":
+        from hermes_state_dbfile import refuse_planted_state_db_link
+
+        refuse_planted_state_db_link(raw_path)
     try:
         path = raw_path.resolve()
     except OSError:
@@ -273,7 +278,7 @@ def acquire(db_path: Optional[Path] = None) -> "SessionDB":
         return winner
 
 
-def release(db: "SessionDB") -> bool:
+def release(db: SessionDB) -> bool:
     """Decrement the refcount of a shared SessionDB. ``True`` if *db* was shared; ``False``
     if it is not registry-managed (caller owns close()). The final release tears the
     generation down OUTSIDE the registry lock. Lookup is object-keyed, so holders of an
@@ -307,17 +312,6 @@ def release(db: "SessionDB") -> bool:
     if needs_teardown:
         _teardown_generation(generation.path, db, barrier=teardown_barrier)
     return True
-
-
-def _path_is_under(path: Path, root: Path) -> bool:
-    """True when *path* is *root* or a file inside it (normcase, resolved)."""
-    try:
-        path_key = os.path.normcase(str(path.resolve()))
-        root_key = os.path.normcase(str(root.resolve()))
-    except OSError:
-        path_key = os.path.normcase(str(path))
-        root_key = os.path.normcase(str(root))
-    return path_key == root_key or path_key.startswith(root_key + os.sep)
 
 
 def _teardown_swept_generations(
@@ -360,7 +354,8 @@ def close_all() -> int:
 
 
 def close_all_under(directory: str | Path) -> int:
-    """Force-close every shared SessionDB whose file lives under *directory*; returns the count.
+    """Force-close every shared SessionDB under *directory* and release its cached header-probe
+    fds; returns the SessionDB close count.
 
     Profile delete rmtree (and a same-name recreate) fails while this process still holds
     ``state.db``. Same contract as ``MemoryStore.release_all_under``: a live holder is
@@ -395,11 +390,56 @@ def close_all_under(directory: str | Path) -> int:
             if _generations.get(generation.path) is generation:
                 _generations.pop(generation.path, None)
             _retired.pop(id(generation.db), None)
-    return _teardown_swept_generations(generations, teardown_barriers, active_teardowns)
+    closed = _teardown_swept_generations(generations, teardown_barriers, active_teardowns)
+    _release_header_probes_under(root)
+    return closed
+
+
+def _release_header_probes_under(root: Path) -> None:
+    """Without this, a probe fd stays open until exit: one per profile a multiplexed gateway ever
+    served. Invariant: a probe is never closed while another descriptor in this process holds its
+    inode, because closing any descriptor cancels every POSIX lock the process holds on the file.
+    The paths' lifecycle locks, held from the scan to the close, make a registry open in flight
+    finish before the scan and keep a new one from starting. Those locks are keyed by pathname, so
+    the inode is rescanned inside ``offline_file_access``, which blocks tracked opens through any
+    spelling (a hard link too) until the close. An untracked ``sqlite3.connect`` that opens between
+    the scan and the close is not covered."""
+    from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+    from hermes_state_dbfile import (
+        close_header_probe_if_unchanged, header_probes_under, inodes_with_other_descriptors,
+    )
+
+    candidates: dict[str, tuple[Path, tuple[int, int, int]]] = {}
+    for key, entry in header_probes_under(root).items():
+        try:
+            candidates[key] = (Path(key).resolve(), entry)
+        except OSError:
+            candidates[key] = (Path(key), entry)
+    if not candidates:
+        return
+    with _lock:
+        locks = {path: _path_lifecycle_lock_locked(path) for path, _entry in candidates.values()}
+    with contextlib.ExitStack() as stack:
+        for path in sorted(locks, key=str):  # one fixed order: two sweeps never deadlock
+            stack.enter_context(locks[path])
+        held_elsewhere = inodes_with_other_descriptors({entry[1:] for _path, entry in candidates.values()})
+        if held_elsewhere is None:
+            return  # descriptor table unreadable: unknown is unsafe
+        for key, (path, entry) in candidates.items():
+            if entry[1:] in held_elsewhere:
+                continue
+            try:
+                with offline_file_access(path, what="close the header probe of"):
+                    held = inodes_with_other_descriptors({entry[1:]})
+                    if held is None or entry[1:] in held:
+                        continue  # opened after the first scan, maybe through another pathname
+                    close_header_probe_if_unchanged(key, entry)
+            except LiveConnectionError:
+                continue  # a tracked connection opened after the scan
 
 
 def other_generations_for_path(
-    db_path: Path, *, exclude: Optional["SessionDB"] = None
+    db_path: Path, *, exclude: Optional[SessionDB] = None
 ) -> list[str]:
     """Describe every other LIVE SessionDB generation THIS process holds for *db_path*.
 
@@ -430,7 +470,7 @@ def other_generations_for_path(
         ]
 
 
-def live_shared_session_dbs() -> list["SessionDB"]:
+def live_shared_session_dbs() -> list[SessionDB]:
     """Snapshot of every live (non-retired) shared SessionDB (refcounts untouched), for
     in-process maintenance. A concurrent final release may close an instance, in which
     case the callee sees ``_conn is None``."""
@@ -439,7 +479,7 @@ def live_shared_session_dbs() -> list["SessionDB"]:
 
 
 @contextlib.contextmanager
-def borrow_live_shared_session_dbs() -> Iterator[list["SessionDB"]]:
+def borrow_live_shared_session_dbs() -> Iterator[list[SessionDB]]:
     """Borrow live handles with registry references pinned for the whole block.
 
     Maintenance must not operate on the unowned snapshot returned by
@@ -471,7 +511,7 @@ def stats() -> dict[str, int]:
         }
 
 
-def release_or_close(db: "SessionDB") -> None:
+def release_or_close(db: SessionDB) -> None:
     """Release a shared instance, or close it when it is not registry-managed. Drop-in for a
     plain ``db.close()``: read-only opens, CLI one-shots and test fakes fall back."""
     if not release(db):

@@ -30,7 +30,18 @@ def sanitize_memory_context(memory_context: str) -> str:
     return elide_middle(sanitized, _MEMORY_CONTEXT_HEAD_CHARS, _MEMORY_CONTEXT_TAIL_CHARS)
 
 
-def automatic_compaction_status_message(engine: Any, *, phase: str, default_message: str, **context: Any) -> str | None:
+class CompactionProgressText(str):
+    """A status line its producer marks as compaction in progress (the lifecycle status kind stays).
+
+    Gateways re-tag only these as ``kind="compacting"``: a warning that merely mentions compression
+    is not progress, and an engine may reword the progress lines. Like ``DiagnosticText``, the mark
+    lives on the object, so classify before ``str()``/``strip()``/formatting drop it.
+    """
+
+
+def automatic_compaction_status_message(
+    engine: Any, *, phase: str, default_message: str, **context: Any
+) -> CompactionProgressText | None:
     """Host-visible status for an automatic compaction event; ``None`` = emit nothing.
 
     Engines suppress via ``emit_automatic_compaction_status = False`` or
@@ -42,7 +53,8 @@ def automatic_compaction_status_message(engine: Any, *, phase: str, default_mess
     message = formatter(phase=phase, default_message=default_message, **context) if callable(formatter) else default_message
     if message is None:
         return None
-    return str(message).strip() or None
+    text = str(message).strip()
+    return CompactionProgressText(text) if text else None
 
 
 class ContextEngine(ABC):
@@ -82,10 +94,10 @@ class ContextEngine(ABC):
         """
 
     @abstractmethod
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int | None = None) -> bool:
         """Return True if compaction should fire this turn."""
 
-    def should_compress_info(self, prompt_tokens: int = None) -> "tuple[bool, str | None]":
+    def should_compress_info(self, prompt_tokens: int | None = None) -> tuple[bool, str | None]:
         """Return ``(should_compress, reason)``.
 
         Engines with block reasons (summary-LLM cooldown, anti-thrashing guard) override
@@ -119,8 +131,8 @@ class ContextEngine(ABC):
         return messages, 0
 
     def select_context(
-        self, request_messages: list[dict[str, Any]], *, conversation_messages: list[dict[str, Any]] = None,
-        incoming_message: dict[str, Any] = None, budget_tokens: int = 0,
+        self, request_messages: list[dict[str, Any]], *, conversation_messages: list[dict[str, Any]] | None = None,
+        incoming_message: dict[str, Any] | None = None, budget_tokens: int = 0,
     ) -> list[dict[str, Any]]:
         """Optionally *select* (replace) the context for THIS request, pre-generation.
 
@@ -140,7 +152,7 @@ class ContextEngine(ABC):
         """
         return None
 
-    def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] = None, **kwargs: Any) -> None:
+    def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] | None = None, **kwargs: Any) -> None:
         """Observe a finished turn (complement of ``select_context()``) to index/update
         routing state for the next request.
 

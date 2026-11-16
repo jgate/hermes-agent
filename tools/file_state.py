@@ -39,6 +39,9 @@ def guard_disabled() -> bool:
 
 
 def _mtime_or_none(resolved: str) -> Optional[float]:
+    from tools.environments.sandbox_scope import hosted_scope
+    if hosted_scope() is not None:
+        return None  # a hosted agent's path names its sandbox, not this host
     try:
         return os.path.getmtime(resolved)
     except OSError:
@@ -251,10 +254,11 @@ def known_reads(task_id: str) -> list[str]:
 
 __all__ = [
     "FileStateRegistry",
-    "get_registry",
-    "record_read",
-    "note_write",
     "check_stale",
+    "get_registry",
+    "known_reads",
     "lock_path",
+    "note_write",
+    "record_read",
     "writes_since",
-    "known_reads"]
+]

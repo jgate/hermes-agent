@@ -360,6 +360,7 @@ def install_pack_plugins(
         _set_plugin_enabled,
     )
     from hermes_cli.plugins_admission import AdmissionRefused
+    from hermes_cli.plugins_cmd_catalog import raise_if_removed
     from hermes_cli.plugins_cmd_install import recorded_install
     results: list[PackInstallResult] = []
 
@@ -374,8 +375,10 @@ def install_pack_plugins(
             continue
         console.print(f"[dim]Installing {display} @ {rp.entry.ref[:12]}...[/dim]")
         try:
+            if not rp.entry.repo:  # a name-only recall names the catalog entry; the core sees only its repo
+                raise_if_removed(rp.entry.name or "")
             # A bare pack name resolved through the plugin catalog; repo entries are custom sources.
-            target, manifest, installed_name = recorded_install(
+            _target, manifest, installed_name = recorded_install(
                 lambda: _install_plugin_core(rp.identifier, force=force, ref=rp.entry.ref),
                 catalog_name=None if rp.entry.repo else rp.entry.name, identifier=rp.identifier)
         except PluginOperationError as exc:
@@ -394,7 +397,7 @@ def install_pack_plugins(
 
         try:
             _set_plugin_enabled(installed_name, enable=True)
-        except AdmissionRefused as exc:
+        except (AdmissionRefused, PluginOperationError) as exc:
             _fail(display, str(exc))
             continue
 
@@ -515,7 +518,7 @@ def cmd_pack_show(source: str) -> None:
     """``hermes plugins pack show <path-or-url>`` — dry-run review."""
     from hermes_cli.plugins_cmd import _console
     console = _console()
-    pack, resolved = _load_and_review(console, source)
+    _pack, resolved = _load_and_review(console, source)
     unresolved = [rp for rp in resolved if rp.identifier is None]
     if unresolved:
         console.print(
